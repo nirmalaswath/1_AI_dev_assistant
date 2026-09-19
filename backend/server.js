@@ -276,6 +276,18 @@ app.post("/ask-stream", async (req, res) => {
     }
 })
 
+async function callLLM(messages) {
+    const completion = await groq.chat.completions.create({
+      model: "openai/gpt-oss-20b",
+      messages,
+      tools: toolDefinitions,
+      tool_choice: "auto",
+      max_completion_tokens: 500,
+      temperature: 0.1
+    });
+  
+    return completion.choices[0].message;
+}
 // Tool calling
 app.post("/tool-test", async (req, res) => {
     const { code } = req.body;
@@ -302,63 +314,59 @@ app.post("/tool-test", async (req, res) => {
     ];
 
     try {
-        const completion = await groq.chat.completions.create({
-            model: "openai/gpt-oss-20b",
-            messages: messages,
-            tools: toolDefinitions,
-            max_completion_tokens: 500,
-            tool_choice: "auto",
-            temperature: 0.1
-        });
-  
-        const assistantMessage = completion.choices[0].message;
+        const MAX_TOOL_ROUNDS = 5;
 
-        messages.push(assistantMessage)
-        
-        if(!assistantMessage.tool_calls?.length){
-            return res.json({
-                answer: assistantMessage.content
-            })
-        }
+        let assistantMessage;
 
-        for (const toolCall of assistantMessage.tool_calls){
-            const toolName = toolCall.function.name;
-            const toolArguments = JSON.parse(toolCall.function.arguments)
-            const selectedTool = toolRegistry[toolName]
+        for (let round=0; round < MAX_TOOL_ROUNDS; round){
 
-            if (!selectedTool) {
-                console.error("Unknown tool requested:", {
-                  toolName,
-                  toolArguments,
-                  registeredTools: Object.keys(toolRegistry)
-                });
-              
-                return res.status(400).json({
-                  error: `Unknown tool: ${toolName}`
-                });
-              }
-            
-            const toolResult = await selectedTool.execute(toolArguments);
-
-            console.log(`Tool Result:`, toolResult)
-            messages.push({
-                role: "tool",
-                tool_call_id: toolCall.id,
-                content: JSON.stringify({
-                    result: toolResult
+            assistantMessage = await callLLM(messages);
+    
+            messages.push(assistantMessage);
+          
+            if (!assistantMessage.tool_calls?.length) {
+              break;
+            }
+    
+            for (const toolCall of assistantMessage.tool_calls){
+                const toolName = toolCall.function.name;
+                const toolArguments = JSON.parse(toolCall.function.arguments)
+                const selectedTool = toolRegistry[toolName]
+                console.log(`Tool round: ${round + 1}`);
+                console.log(`Executing tool: ${toolName}`);
+                if (!selectedTool) {
+                    console.error("Unknown tool requested:", {
+                      toolName,
+                      toolArguments,
+                      registeredTools: Object.keys(toolRegistry)
+                    });
+                  
+                    return res.status(400).json({
+                      error: `Unknown tool: ${toolName}`
+                    });
+                  }
+                
+                const toolResult = await selectedTool.execute(toolArguments);
+    
+                console.log(`Tool Result:`, toolResult)
+                messages.push({
+                    role: "tool",
+                    tool_call_id: toolCall.id,
+                    content: JSON.stringify({
+                        result: toolResult
+                    })
                 })
-            })
+            }
         }
 
-        const finalCompletion = await groq.chat.completions.create({
-            model: "openai/gpt-oss-20b",
-            messages,
-            max_completion_tokens: 500,
-            temperature: 0.1
-          });
-        console.log(finalCompletion.choices[0].message, 'final')
+        if (assistantMessage.tool_calls?.length) {
+            return res.status(500).json({
+              error: "Maximum tool-call rounds exceeded"
+            });
+          }
+          
         res.json({
-            answer: finalCompletion.choices[0].message.content
+            answer: assistantMessage.content
         });
     } catch (error) {
       console.error("Tool-calling error: ", error);
